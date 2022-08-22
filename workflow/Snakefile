@@ -1,0 +1,319 @@
+
+
+bamCoverage_path      = '/data/proj/GCB_MB/miniconda3/envs/bcdCT/bin/bamCoverage'
+fastqc_path           = '/home/marek/bin/fastqc/FastQC/fastqc'
+cutadapt_path         = '/data/proj/GCB_MB/miniconda3/envs/cutadapt/bin/cutadapt'
+bowtie2_path          = '/data/proj/GCB_MB/miniconda3/envs/bcdCT/bin/bowtie2'
+bowtie2_index         = '/data/proj/GCB_MB/reference/bowtie2_index/mm10_cellranger_compatible/mm10'
+picard_path           = '/home/marek/bin/picard/picard.jar'
+cellranger_path       = '/home/marek/bin/cellranger-atac-2.1.0/cellranger-atac' # Cellranger-atac with modified 737K-cratac-v1_YD.txt 737K-cratac-v1.txt file
+cellranger_ref_dir    = config['cellranger_ref']
+
+
+
+workflow_dir = os.path.dirname(workflow.basedir)
+results_dir  = os.getcwd()
+# tempdir      = results_dir + '/tmp'
+
+
+
+if config['condaenv']:
+    shell.prefix("source ~/.bash_profile; conda activate " + config['condaenv'] + " ; ")
+
+
+rule all:
+    input:
+        expand('{sample}/adaptors_stats.txt', modality = config['modalities'].keys(),sample=config['sample']),
+        expand('{sample}/{modality}/fastq_demultiplexed/fastqc/', modality = config['modalities'].keys(),sample=config['sample']),
+        expand('{sample}/{modality}/fastq_demultiplexed/fastqc_trimmed/', modality = config['modalities'].keys(),sample=config['sample']),
+        expand('{sample}/{modality}/bam/{r}/{sample}_bowtie2_mapped.bam', modality = config['modalities'].keys(),sample=config['sample'], r = ['R1','R2']),# Map reads as single-end
+        expand('{sample}/{modality}/bam/{sample}_bowtie2_{x}sorted.bam', modality = config['modalities'].keys(),sample=config['sample'],x = ['name','pos']),# Map reads as single-end
+        expand('{sample}/{modality}/bam/{sample}_bowtie2_complexity_metrics.txt', modality = config['modalities'].keys(),sample=config['sample']),
+        expand('{sample}/{modality}/bed/{sample}_fragments.bed', modality = config['modalities'].keys(),sample=config['sample']),
+        expand('{sample}/{modality}/bigwig/{sample}_nodup.bw', modality = config['modalities'].keys(),sample=config['sample']),
+        expand('{sample}/{modality}/peaks/macs2_narrow/{sample}_{modality}_peaks.narrowPeak', modality= config['modalities'].keys(),sample=config['sample']),
+        expand('{sample}/{modality}/peaks/macs2_narrow/{sample}_{modality}_peaks.broadPeak', modality = config['modalities'].keys(),sample=config['sample']),
+        expand('{sample}/{modality}/cellranger/{sample}/outs/fragments.tsv.gz', modality = config['modalities'].keys(),sample=config['sample']),
+        expand('{sample}/reads_summary_QC.txt',sample=config['sample']),
+
+
+rule bcd_statistics:
+    input:
+        fastq_R1 = config['fastq']['R1'],
+    output:
+        stats = '{sample}/adaptors_stats.txt'
+    params:
+        script = workflow_dir + '/scripts/summarize_adaptors.py'
+    shell:
+        'python3 {params.script} --input {input.fastq_R1} --output {output.stats}'
+
+rule bcd_process:
+    input:
+        fastq_R1  = config['fastq']['R1'],
+    output:
+        fastq_o1 = '{sample}/{modality}/fastq_demultiplexed/{sample}_S1_L001_R1_001.fastq.gz',
+        fastq_o2 = '{sample}/{modality}/fastq_demultiplexed/{sample}_S1_L001_R2_001.fastq.gz',
+        log      = '{sample}/{modality}/fastq_demultiplexed/{sample}.log'
+    params:
+        barcode = lambda wildcards: config['modalities'][wildcards.modality],
+        script = workflow_dir + '/scripts/BC_process_nano.py'
+    shell:
+        "python3 {params.script} -i {input.fastq_R1} -o1 {output.fastq_o1} -o2 {output.fastq_o2} --barcode {params.barcode} 2>&1 > {output.log}"
+
+rule filter_R2: # Here rename R2 to R3
+    input:
+        fastq_R1 = '{sample}/{modality}/fastq_demultiplexed/{sample}_S1_L001_R1_001.fastq.gz',
+        fastq_R2 = config['fastq']['R2']
+    output:
+        fastq_R3 = '{sample}/{modality}/fastq_demultiplexed/{sample}_S1_L001_R3_001.fastq.gz',
+    params:
+        read_names_lst = temp('{sample}/{modality}/fastq_demultiplexed/{sample}_S1_L001_R3_001.lst'),
+        script         = workflow_dir + '/scripts/filter_R2.py'
+    shell:
+        # "python3 {params.script} --input_R1 {input.fastq_R1} --input_R2 {input.fastq_R2} --output {params.read_names_lst}; "
+        "gunzip -c {input.fastq_R1} | awk '/^@/ {{print $1}}' | sed 's/@//g' > {params.read_names_lst}; "
+        "seqtk subseq {input.fastq_R2} {params.read_names_lst} | gzip > {output.fastq_R3}"
+
+
+rule run_fastqc:
+    input:
+        fastq_R1 = '{sample}/{modality}/fastq_demultiplexed/{sample}_S1_L001_R1_001.fastq.gz',
+        fastq_R3 = '{sample}/{modality}/fastq_demultiplexed/{sample}_S1_L001_R3_001.fastq.gz',
+    output:
+        directory('{sample}/{modality}/fastq_demultiplexed/fastqc/',)
+    shell:
+        '{fastqc_path} {input.fastq_R1} {input.fastq_R3} -o {output}'
+
+rule trim_nextera_cutadapt:
+    input:
+        fastq_R1 = '{sample}/{modality}/fastq_demultiplexed/{sample}_S1_L001_R1_001.fastq.gz',
+        fastq_R3 = '{sample}/{modality}/fastq_demultiplexed/{sample}_S1_L001_R3_001.fastq.gz',
+    output:
+        fastq_trimmed_R1 = '{sample}/{modality}/fastq_demultiplexed/{sample}_trimmed_S1_L001_R1_001.fastq.gz',
+        fastq_trimmed_R3 = '{sample}/{modality}/fastq_demultiplexed/{sample}_trimmed_S1_L001_R3_001.fastq.gz',
+    params:
+        adapter_nextera = 'CTGTCTCTTATA'
+    shell:
+        '{cutadapt_path} -a {params.adapter_nextera} -A {params.adapter_nextera} -o {output.fastq_trimmed_R1} -p {output.fastq_trimmed_R3} {input.fastq_R1} {input.fastq_R3}; '
+
+rule filter_R2_index_read:
+    input:
+        fastq_R2 = '{sample}/{modality}/fastq_demultiplexed/{sample}_S1_L001_R2_001.fastq.gz'
+    output:
+        fastq_R2 = '{sample}/{modality}/fastq_demultiplexed/{sample}_trimmed_S1_L001_R2_001.fastq.gz'
+    params:
+        read_names_lst = temp('{sample}/{modality}/fastq_demultiplexed/{sample}_S1_L001_R2_001.lst'),
+    shell:
+        "gunzip -c  {input.fastq_R2} | awk '/^@/ {{print $1}}' | sed 's/@//g' > {params.read_names_lst}; "
+        "seqtk subseq {input.fastq_R2} {params.read_names_lst} | gzip > {output.fastq_R2}"
+
+rule run_fastqc_after_trim:
+    input:
+        fastq_trimmed_R1 = '{sample}/{modality}/fastq_demultiplexed/{sample}_trimmed_S1_L001_R1_001.fastq.gz',
+        fastq_trimmed_R3 = '{sample}/{modality}/fastq_demultiplexed/{sample}_trimmed_S1_L001_R3_001.fastq.gz',
+    output:
+        directory('{sample}/{modality}/fastq_demultiplexed/fastqc_trimmed/'),
+    shell:
+        '{fastqc_path} {input.fastq_trimmed_R1} {input.fastq_trimmed_R3} -o {output}'
+
+rule map_with_bowtie:
+    input:
+        trimmed_R1 = '{sample}/{modality}/fastq_demultiplexed/{sample}_trimmed_S1_L001_R1_001.fastq.gz',
+        trimmed_R2 = '{sample}/{modality}/fastq_demultiplexed/{sample}_trimmed_S1_L001_R3_001.fastq.gz',
+        R3         = '{sample}/{modality}/fastq_demultiplexed/{sample}_S1_L001_R2_001.fastq.gz',
+    output:
+        bam = '{sample}/{modality}/bam/{sample}_bowtie2_mapped.bam',
+        log = '{sample}/{modality}/bam/{sample}_bowtie2.log',
+    threads: 8
+    params:
+        bowtie2_index = bowtie2_index
+    shell:
+        '{bowtie2_path} --dovetail --local --very-sensitive --no-unal -p {threads} -x {params.bowtie2_index} -1 {input.trimmed_R1} -2 {input.trimmed_R2} 2> {output.log} | samtools view -F 4 -bS - > {output.bam} '
+
+rule map_with_bowtie_R1:
+    input:
+        trimmed_R1 = '{sample}/{modality}/fastq_demultiplexed/{sample}_trimmed_S1_L001_R1_001.fastq.gz',
+        trimmed_R2 = '{sample}/{modality}/fastq_demultiplexed/{sample}_trimmed_S1_L001_R3_001.fastq.gz',
+        R3         = '{sample}/{modality}/fastq_demultiplexed/{sample}_S1_L001_R2_001.fastq.gz',
+    output:
+        bam = '{sample}/{modality}/bam/R1/{sample}_bowtie2_mapped.bam',
+        log = '{sample}/{modality}/bam/R1/{sample}_bowtie2.log',
+    threads: 8
+    params:
+        bowtie2_index = bowtie2_index,
+    shell:
+        '{bowtie2_path} --dovetail --local --very-sensitive --no-unal -p {threads} -x {params.bowtie2_index} -U {input.trimmed_R1} 2> {output.log} | samtools view -F 4 -bS - > {output.bam} '
+
+rule map_with_bowtie_R2:
+    input:
+        trimmed_R1 = '{sample}/{modality}/fastq_demultiplexed/{sample}_trimmed_S1_L001_R1_001.fastq.gz',
+        trimmed_R2 = '{sample}/{modality}/fastq_demultiplexed/{sample}_trimmed_S1_L001_R3_001.fastq.gz',
+        R3         = '{sample}/{modality}/fastq_demultiplexed/{sample}_S1_L001_R2_001.fastq.gz',
+    output:
+        bam = '{sample}/{modality}/bam/R2/{sample}_bowtie2_mapped.bam',
+        log = '{sample}/{modality}/bam/R2/{sample}_bowtie2.log',
+    threads: 8
+    params:
+        bowtie2_index = bowtie2_index
+    shell:
+        '{bowtie2_path} --dovetail --local --very-sensitive --no-unal -p {threads} -x {params.bowtie2_index} -U {input.trimmed_R2} 2> {output.log} | samtools view -F 4 -bS - > {output.bam} '
+
+rule sort_read_name:
+    input:
+        bam = '{sample}/{modality}/bam/{sample}_bowtie2_possorted_rmdup.bam',
+    output:
+        bam = '{sample}/{modality}/bam/{sample}_bowtie2_namesorted.bam',
+    threads: 8
+    params:
+        tempdir = config['tempdir']
+    shell:
+        'samtools sort -n -@ {threads} -T {params.tempdir} -o {output.bam} {input.bam}'
+
+rule sort_reads_position:
+    input:
+        bam = '{sample}/{modality}/bam/{sample}_bowtie2_mapped.bam',
+    output:
+        bam = '{sample}/{modality}/bam/{sample}_bowtie2_possorted.bam',
+    threads: 8
+    params:
+        tempdir = config['tempdir']
+    shell:
+        'samtools sort {input.bam} -@ {threads} -T {params.tempdir} -o {output.bam}'
+
+rule bam_to_fragments:
+    input:
+        bam = '{sample}/{modality}/bam/{sample}_bowtie2_mapped.bam',
+    output:
+        fragments = '{sample}/{modality}/bed/{sample}_fragments.bed'
+    params:
+        script = workflow_dir + '/scripts/bedpe_to_fragments.py'
+    shell:
+        "bedtools bamtobed -bedpe -i {input.bam} 2>/dev/null | python3 {params.script} > {output.fragments}"
+
+rule remove_duplicates:
+    input:
+        bam     = '{sample}/{modality}/bam/{sample}_bowtie2_possorted.bam',
+    output:
+        bam     = '{sample}/{modality}/bam/{sample}_bowtie2_possorted_rmdup.bam',
+        metrics = '{sample}/{modality}/bam/{sample}_rmdup_metrics.txt',
+    shell:
+        """
+        java -jar {picard_path} MarkDuplicates I={input.bam} O={output.bam} M={output.metrics} REMOVE_DUPLICATES=true
+        """
+
+rule index_bam:
+    input:
+        bam = '{sample}/{modality}/bam/{sample}_bowtie2_possorted_rmdup.bam',
+    output:
+        bam = '{sample}/{modality}/bam/{sample}_bowtie2_possorted_rmdup.bam.bai',
+    shell:
+        'samtools index {input.bam}'
+
+rule bam_to_bw:
+    input:
+        bam   = '{sample}/{modality}/bam/{sample}_bowtie2_possorted_rmdup.bam',
+        index = '{sample}/{modality}/bam/{sample}_bowtie2_possorted_rmdup.bam.bai',
+    output:
+        bigwig = '{sample}/{modality}/bigwig/{sample}_nodup.bw',
+    threads: 8
+    shell:
+        '''{bamCoverage_path} --bam {input.bam} --outFileName {output.bigwig} --numberOfProcessors {threads} \
+                           --normalizeUsing RPKM --binSize 50 --smoothLength 250 '''
+
+rule estimate_complexity:
+    input:
+        bam = '{sample}/{modality}/bam/{sample}_bowtie2_mapped.bam'
+    output:
+        metrics = '{sample}/{modality}/bam/{sample}_bowtie2_complexity_metrics.txt'
+    shell:
+        'java -jar {picard_path} EstimateLibraryComplexity I={input.bam} O={output.metrics}'
+
+        
+rule run_macs_narrow:
+    input:
+        bam = '{sample}/{modality}/bam/{sample}_bowtie2_possorted_rmdup.bam'
+    output:
+        narrow_peaks = '{sample}/{modality}/peaks/macs2_narrow/{sample}_{modality}_peaks.narrowPeak'
+    params:
+        macs_outdir  = '{sample}/{modality}/peaks/macs2_narrow/'
+    shell:
+        'macs2 callpeak -t {input.bam} -g mm -f BAMPE -n {wildcards.sample}_{wildcards.modality} '
+        '--outdir {params.macs_outdir} --keep-dup=1 --llocal 500000 --cutoff-analysis --max-gap 1000  2>&1 '
+
+rule run_macs_broad:
+    input:
+        bam = '{sample}/{modality}/bam/{sample}_bowtie2_possorted_rmdup.bam'
+    output:
+        broad_peaks = '{sample}/{modality}/peaks/macs2_narrow/{sample}_{modality}_peaks.broadPeak'
+    params:
+        macs_outdir  = '{sample}/{modality}/peaks/macs2_narrow/'
+    shell:
+        'macs2 callpeak -t {input.bam} -g mm -f BAMPE -n {wildcards.sample}_{wildcards.modality} '
+        '--outdir {params.macs_outdir} --keep-dup=1 --broad --llocal 500000 --cutoff-analysis --max-gap 1000  2>&1 '
+
+rule modify_peaks_for_cellranger:
+    input:
+        peaks = '{sample}/{modality}/peaks/macs2_narrow/{sample}_{modality}_peaks.broadPeak'
+    output:
+        peaks = '{sample}/{modality}/peaks/for_cellranger/{sample}_{modality}_peaks.bed'
+    shell:
+        """
+        awk 'BEGIN{{FS=OFS="\t"}}{{print $1,$2,$3 }}' {input.peaks} | grep '^chr[0-9MXY]*' > {output.peaks}
+        """
+
+rule run_cellranger:
+    input:
+        fastq_trimmed_R1 = '{sample}/{modality}/fastq_demultiplexed/{sample}_trimmed_S1_L001_R1_001.fastq.gz',
+        fastq_trimmed_R2 = '{sample}/{modality}/fastq_demultiplexed/{sample}_trimmed_S1_L001_R3_001.fastq.gz',
+        fastq_R3         = '{sample}/{modality}/fastq_demultiplexed/{sample}_trimmed_S1_L001_R2_001.fastq.gz',
+        peaks_broad      = '{sample}/{modality}/peaks/for_cellranger/{sample}_{modality}_peaks.bed' # Write lambda for scATAC track
+    output:
+        fragments = '{sample}/{modality}/cellranger/{sample}/outs/fragments.tsv.gz'
+    params:
+        # Paths to the cellranger files have to be specified as absolute paths
+        prefix                   = lambda wildcards: os.path.abspath(results_dir),
+        cellranger_fastq_dirname = lambda wildcards: '{prefix}/{sample}/{modality}/fastq_demultiplexed'.format(prefix = os.path.abspath(results_dir), sample = wildcards.sample, modality = wildcards.modality),
+    threads: 40
+    shell:
+        ''' cd {params.prefix}/{wildcards.sample}/{wildcards.modality}/cellranger/;  
+        rm -rf {wildcards.sample}; 
+        {cellranger_path} count \
+        --id={wildcards.sample} \
+        --reference={cellranger_ref_dir} \
+        --fastqs={params.cellranger_fastq_dirname}\
+        --sample={wildcards.sample}_trimmed \
+        --force-cells=2500 \
+        --peaks={params.prefix}/{input.peaks_broad}
+        '''
+
+rule summarize_analysis_for_QC:
+    input:
+        raw_fastq           = config['fastq']['R1'],
+        demultiplexed_fastq = lambda wildcards: expand('{sample}/{modality}/fastq_demultiplexed/{sample}_S1_L001_R1_001.fastq.gz',modality = config['modalities'].keys(), sample = wildcards.sample),
+        cutadapt_fastq      = lambda wildcards: expand('{sample}/{modality}/fastq_demultiplexed/{sample}_trimmed_S1_L001_R1_001.fastq.gz',modality = config['modalities'].keys(), sample = wildcards.sample),
+        bowtie2_mapped      = lambda wildcards: expand('{sample}/{modality}/bam/{sample}_bowtie2_namesorted.bam',modality = config['modalities'].keys(), sample = wildcards.sample),
+        bowtie2_Q30         = lambda wildcards: expand('{sample}/{modality}/bam/{sample}_bowtie2_namesorted.bam',modality = config['modalities'].keys(), sample = wildcards.sample),
+    output:
+        summary_txt = '{sample}/reads_summary_QC.txt'
+    shell:
+        """
+        echo -n 'raw_reads    {input.raw_fastq}    ' > {output.summary_txt}
+        gunzip -c {input.raw_fastq} | wc -l | awk '{{print $1/4}}' >> {output.summary_txt};
+        ls {input.demultiplexed_fastq} | while read line; do
+          echo -n 'demultiplexed    '$line'    ' >> {output.summary_txt};
+          gunzip -c $line | wc -l | awk '{{print $1/4}}' >> {output.summary_txt};
+          done
+        ls {input.cutadapt_fastq} | while read line; do
+          echo -n 'after_trimming    '$line'    ' >> {output.summary_txt};
+          gunzip -c $line | wc -l | awk '{{print $1/4}}' >> {output.summary_txt};
+          done
+        ls {input.bowtie2_mapped} | while read line; do
+          echo -n 'mapped    '$line'    ' >> {output.summary_txt};
+          samtools view $line | cut -f1 | uniq | wc -l >> {output.summary_txt};
+          done
+        ls {input.bowtie2_Q30} | while read line; do
+          echo -n 'mapped_Q30    '$line'    ' >> {output.summary_txt};
+          samtools view -q 30 $line | cut -f1 | uniq | wc -l >> {output.summary_txt};
+          done
+        """
+
